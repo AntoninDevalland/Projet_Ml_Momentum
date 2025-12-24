@@ -278,3 +278,42 @@ def garch_fit_predict(
         pass
 
     return sigma_hat, diag
+
+from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+
+def msar1_fit_predict(y_win: pd.Series, k_regimes: int = 2, switching_variance: bool = True,
+                     trend: str = "c", maxiter: int = 200, disp: bool = False):
+    """
+    Fit MS-AR(1) on y_win and return 1-step-ahead forecast + diagnostics.
+    """
+    y_arr = y_win.astype(float).to_numpy()
+
+    # AR(1) with Markov-switching intercept (trend='c'), and optionally switching variance
+    mod = MarkovRegression(
+        endog=y_arr,
+        k_regimes=k_regimes,
+        trend=trend,           # 'c' for intercept, 'n' for none
+        order=1,
+        switching_variance=switching_variance,
+    )
+
+    try:
+        res = mod.fit(disp=disp, maxiter=maxiter)
+
+        # 1-step ahead forecast (end of sample + 1)
+        # predict() uses index in "observation number" units here
+        yhat_next = float(res.predict(start=len(y_arr), end=len(y_arr))[0])
+
+        # Regime probas at the last in-sample point
+        # filtered_marginal_probabilities: (T x k_regimes)
+        p_last = res.filtered_marginal_probabilities[-1]
+        diag = {
+            "converged": bool(getattr(res.mle_retvals, "converged", True)),
+            "llf": float(res.llf),
+            **{f"p_regime_{j}": float(p_last[j]) for j in range(k_regimes)}
+        }
+        return yhat_next, diag
+
+    except Exception as e:
+        # In rolling estimation, some windows can fail to converge; don't kill the whole backtest
+        return np.nan, {"converged": False, "error": str(e)}
