@@ -8,6 +8,7 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from sklearn.metrics import r2_score, mean_squared_error
 from arch import arch_model
+from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 
 
 
@@ -279,7 +280,7 @@ def garch_fit_predict(
 
     return sigma_hat, diag
 
-from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+
 
 def msar1_fit_predict(y_win: pd.Series, k_regimes: int = 2, switching_variance: bool = True,
                      trend: str = "c", maxiter: int = 200, disp: bool = False):
