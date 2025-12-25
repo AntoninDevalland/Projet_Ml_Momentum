@@ -55,6 +55,53 @@ def rolling_window_forecast(
     diag_df = pd.DataFrame(diag_rows).set_index("date") if diag_rows else pd.DataFrame()
     return fcast, diag_df
 
+def expanding_window_forecast(
+    y: pd.Series,
+    fit_predict_fn,
+    min_window: int,
+    X: pd.DataFrame | None = None,
+    **model_kwargs,
+) -> tuple[pd.Series, pd.DataFrame]:
+    """
+    Expanding 1-step ahead forecast engine with optional regressors X.
+
+    Uses an expanding window: start with `min_window` observations, then
+    keep adding one observation each step.
+
+    Additional keyword arguments (**model_kwargs) are forwarded
+    to fit_predict_fn.
+    """
+    # Align / clean
+    if X is None:
+        y2 = y.dropna().copy()
+        X2 = None
+    else:
+        df = pd.concat([y.rename("y"), X], axis=1).dropna()
+        y2 = df["y"].copy()
+        X2 = df.drop(columns=["y"]).copy()
+
+    fcast = pd.Series(index=y2.index, dtype=float)
+    diag_rows = []
+
+    # end is the last in-sample index position; we forecast end+1
+    for end in range(min_window - 1, len(y2) - 1):
+        y_win = y2.iloc[: end + 1]
+
+        if X2 is None:
+            yhat_next, diag = fit_predict_fn(y_win, **model_kwargs)
+        else:
+            X_win = X2.iloc[: end + 1]
+            yhat_next, diag = fit_predict_fn(y_win, X_win, **model_kwargs)
+
+        forecast_date = y2.index[end + 1]
+        fcast.loc[forecast_date] = float(yhat_next)
+
+        diag = {} if diag is None else dict(diag)
+        diag_rows.append({"date": forecast_date, **diag})
+
+    diag_df = pd.DataFrame(diag_rows).set_index("date") if diag_rows else pd.DataFrame()
+    return fcast, diag_df
+
 
 def har_fit_predict(
     y_win: pd.Series,
