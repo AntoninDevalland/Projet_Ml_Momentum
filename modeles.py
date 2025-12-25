@@ -11,20 +11,28 @@ from arch import arch_model
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 
 
-
 def rolling_window_forecast(
     y: pd.Series,
     fit_predict_fn,
     window: int,
     X: pd.DataFrame | None = None,
+    *,
+    horizon: int = 1,
+    step: int = 1,
     **model_kwargs,
-) -> tuple[pd.Series, pd.DataFrame]:
+) -> pd.Series:
     """
-    Rolling 1-step ahead forecast engine with optional regressors X.
+    Rolling forecast engine (walk-forward).
 
-    Additional keyword arguments (**model_kwargs) are forwarded
-    to fit_predict_fn.
+    - horizon : horizon de prévision (nb de jours futurs)
+    - step    : fréquence de recalcul (1=tous les jours, H=non-overlapping)
+
+    La prévision produite à la date t est TOUJOURS indexée à t + horizon.
     """
+
+    if horizon < 1 or step < 1:
+        raise ValueError("horizon and step must be positive integers.")
+
     # Align / clean
     if X is None:
         y2 = y.dropna().copy()
@@ -34,43 +42,57 @@ def rolling_window_forecast(
         y2 = df["y"].copy()
         X2 = df.drop(columns=["y"]).copy()
 
-    fcast = pd.Series(index=y2.index, dtype=float)
-    diag_rows = []
+    start_end = window - 1
+    last_end = len(y2) - horizon - 1
+    if last_end < start_end:
+        raise ValueError("Not enough data for given window and horizon.")
 
-    for end in range(window - 1, len(y2) - 1):
+    dates = []
+    preds = []
+
+    for end in range(start_end, last_end + 1, step):
         y_win = y2.iloc[end - window + 1 : end + 1]
 
         if X2 is None:
-            yhat_next, diag = fit_predict_fn(y_win, **model_kwargs)
+            out = fit_predict_fn(y_win, horizon=horizon, **model_kwargs)
         else:
             X_win = X2.iloc[end - window + 1 : end + 1]
-            yhat_next, diag = fit_predict_fn(y_win, X_win, **model_kwargs)
+            out = fit_predict_fn(y_win, X_win, horizon=horizon, **model_kwargs)
 
-        forecast_date = y2.index[end + 1]
-        fcast.loc[forecast_date] = float(yhat_next)
+        # accepte yhat seul ou (yhat, diag)
+        yhat = out[0] if isinstance(out, tuple) else out
 
-        diag = {} if diag is None else dict(diag)
-        diag_rows.append({"date": forecast_date, **diag})
+        forecast_date = y2.index[end + horizon]  # TOUJOURS fin d'horizon
 
-    diag_df = pd.DataFrame(diag_rows).set_index("date") if diag_rows else pd.DataFrame()
-    return fcast, diag_df
+        dates.append(forecast_date)
+        preds.append(float(yhat))
+
+    fcast = pd.Series(preds, index=pd.Index(dates, name="date"), name="forecast")
+    return fcast
+
 
 def expanding_window_forecast(
     y: pd.Series,
     fit_predict_fn,
     min_window: int,
     X: pd.DataFrame | None = None,
+    *,
+    horizon: int = 1,
+    step: int = 1,
     **model_kwargs,
-) -> tuple[pd.Series, pd.DataFrame]:
+) -> pd.Series:
     """
-    Expanding 1-step ahead forecast engine with optional regressors X.
+    Expanding forecast engine (walk-forward).
 
-    Uses an expanding window: start with `min_window` observations, then
-    keep adding one observation each step.
+    - horizon : horizon de prévision (nb de jours futurs)
+    - step    : fréquence de recalcul (1=tous les jours, H=non-overlapping)
 
-    Additional keyword arguments (**model_kwargs) are forwarded
-    to fit_predict_fn.
+    La prévision produite à la date t est TOUJOURS indexée à t + horizon.
     """
+
+    if horizon < 1 or step < 1:
+        raise ValueError("horizon and step must be positive integers.")
+
     # Align / clean
     if X is None:
         y2 = y.dropna().copy()
@@ -80,28 +102,32 @@ def expanding_window_forecast(
         y2 = df["y"].copy()
         X2 = df.drop(columns=["y"]).copy()
 
-    fcast = pd.Series(index=y2.index, dtype=float)
-    diag_rows = []
+    start_end = min_window - 1
+    last_end = len(y2) - horizon - 1
+    if last_end < start_end:
+        raise ValueError("Not enough data for given min_window and horizon.")
 
-    # end is the last in-sample index position; we forecast end+1
-    for end in range(min_window - 1, len(y2) - 1):
-        y_win = y2.iloc[: end + 1]
+    dates = []
+    preds = []
+
+    for end in range(start_end, last_end + 1, step):
+        y_win = y2.iloc[: end + 1]  # expanding window
 
         if X2 is None:
-            yhat_next, diag = fit_predict_fn(y_win, **model_kwargs)
+            out = fit_predict_fn(y_win, horizon=horizon, **model_kwargs)
         else:
             X_win = X2.iloc[: end + 1]
-            yhat_next, diag = fit_predict_fn(y_win, X_win, **model_kwargs)
+            out = fit_predict_fn(y_win, X_win, horizon=horizon, **model_kwargs)
 
-        forecast_date = y2.index[end + 1]
-        fcast.loc[forecast_date] = float(yhat_next)
+        yhat = out[0] if isinstance(out, tuple) else out
 
-        diag = {} if diag is None else dict(diag)
-        diag_rows.append({"date": forecast_date, **diag})
+        forecast_date = y2.index[end + horizon]  # TOUJOURS fin d'horizon
 
-    diag_df = pd.DataFrame(diag_rows).set_index("date") if diag_rows else pd.DataFrame()
-    return fcast, diag_df
+        dates.append(forecast_date)
+        preds.append(float(yhat))
 
+    fcast = pd.Series(preds, index=pd.Index(dates, name="date"), name="forecast")
+    return fcast
 
 def har_fit_predict(
     y_win: pd.Series,
@@ -160,7 +186,7 @@ def har_fit_predict(
     return yhat_next, diag
 
 
-def ar1_fit_predict(y_win: pd.Series) -> tuple[float, dict]:
+def ar1_fit_predict(y_win: pd.Series, horizon: int = 1) -> tuple[float, dict]:
     """
     AR(1): y_t = a + b y_{t-1} + e_t, estimated by OLS on the window.
     Returns forecast for next point (t+1) and diagnostics (R2_IS, beta, t_beta).
@@ -191,13 +217,7 @@ def ar1_fit_predict(y_win: pd.Series) -> tuple[float, dict]:
     # 1-step ahead forecast
     yhat_next = a + b * y_win.iloc[-1]
 
-    return float(yhat_next), {
-        "alpha": float(a),
-        "beta": float(b),
-        "t_beta": t_beta,
-        "R2_IS": float(r2_is),
-        "n_pairs": int(n),
-    }
+    return float(yhat_next)
 
 
 def forecast_quality_oos(y_true: pd.Series, y_pred: pd.Series) -> pd.Series:
@@ -231,51 +251,50 @@ def forecast_quality_oos(y_true: pd.Series, y_pred: pd.Series) -> pd.Series:
 
 def garch_fit_predict(
     r_win: pd.Series,
-    horizon: int = 1,
+    horizon: int,
     p: int = 1,
     q: int = 1,
     mean: str = "constant",
     dist: str = "normal",
-) -> tuple[float, dict]:
+) -> float:
     """
-    Rolling GARCH(p,q) on returns.
+    Fit GARCH(p,q) sur des rendements journaliers (en décimal) et prédit la
+    realized variance (proxy) sur `horizon` jours:
 
-    Fits a univariate GARCH(p,q) on r_win (returns), then produces an
-    h-step-ahead *volatility* forecast for the horizon:
-        sigma_{t,t+h} = sqrt(sum_{i=1..h} h_{t+i})
+        RV_hat_{t->t+h} = sum_{i=1..h} E_t[r_{t+i}^2] ~= sum_{i=1..h} sigma^2_{t+i|t}
 
-    Inputs
-    ------
+    Paramètres
+    ----------
     r_win : pd.Series
-        Returns in decimal units (e.g., 0.001 = 0.1%).
+        Rendements en décimal (0.001 = 0.1%).
     horizon : int
-        Forecast horizon in trading days (1=daily, 5=weekly-ish, 20=monthly-ish).
+        Horizon de prévision (nb de jours de trading), ex: 5.
     p, q : int
-        GARCH orders.
+        Ordres GARCH.
     mean : {"constant","zero"}
-        Mean specification.
     dist : {"normal","t","skewt"}
-        Innovation distribution.
 
-    Returns
-    -------
-    sigma_hat : float
-        Forecast volatility over `horizon` days in decimal units.
-        (Same units as r_win: e.g., 0.02 = 2% over the horizon.)
-    diag : dict
-        Basic in-sample diagnostics and fitted params.
+    Retour
+    ------
+    RV_hat : float
+        Prévision de variance cumulée sur `horizon` jours (en unités décimales^2).
+        Ex: 0.0004 ~ (2%)^2 sur l'horizon si tu prends sqrt ensuite.
     """
-    # Lazy import so your notebook only needs arch when you call this.
+    if not isinstance(horizon, int) or horizon < 1:
+        raise ValueError("horizon must be a positive integer.")
 
-    r_win = r_win.dropna()
+    r_win = r_win.dropna().astype(float)
     if len(r_win) < max(50, 10 * (p + q + 1)):
         raise ValueError("Window too small for stable GARCH estimation.")
 
-    # arch is more numerically stable with percent returns
-    r_pct = 100.0 * r_win.astype(float)
+    # arch est plus stable en pourcents
+    r_pct = 100.0 * r_win
 
     mean_spec = "Constant" if mean.lower() == "constant" else "Zero"
-    dist_spec = {"normal": "normal", "t": "t", "skewt": "skewt"}[dist.lower()]
+    dist_key = dist.lower()
+    if dist_key not in {"normal", "t", "skewt"}:
+        raise ValueError("dist must be one of {'normal','t','skewt'}.")
+    dist_spec = {"normal": "normal", "t": "t", "skewt": "skewt"}[dist_key]
 
     am = arch_model(
         r_pct,
@@ -284,50 +303,19 @@ def garch_fit_predict(
         p=p,
         q=q,
         dist=dist_spec,
-        rescale=False,  # we already scaled to %
+        rescale=False,  # déjà en %
     )
     res = am.fit(disp="off")
 
-    # Forecast: variance path for 1..horizon (in (%ret)^2)
+    # Variances forecast 1..horizon en (%ret)^2
     f = res.forecast(horizon=horizon, reindex=False)
-    vars_h = f.variance.iloc[-1].to_numpy()  # length=horizon
-    var_H = float(np.sum(vars_h))
-    sigma_H_pct = float(np.sqrt(var_H))      # % over horizon
+    vars_h = f.variance.iloc[-1].to_numpy()  # longueur = horizon
+    var_H_pct2 = float(np.sum(vars_h))       # variance cumulée sur H jours en (%^2)
 
-    # Back to decimal units
-    sigma_hat = sigma_H_pct / 100.0
+    # Retour en unités décimales^2 (car r_pct = 100 * r_dec)
+    RV_hat = var_H_pct2 / (100.0 ** 2)
 
-    # In-sample diagnostics
-    # Note: res.conditional_volatility is in % (same scaling as r_pct)
-    cond_vol_pct = res.conditional_volatility
-    resid = res.std_resid  # standardized residuals
-    diag = {
-        "model": f"GARCH({p},{q})",
-        "mean": mean_spec,
-        "dist": dist_spec,
-        "n_obs": int(res.nobs),
-        "horizon": int(horizon),
-        "loglik": float(res.loglikelihood),
-        "aic": float(res.aic),
-        "bic": float(res.bic),
-        "last_cond_vol_1d": float(cond_vol_pct.iloc[-1] / 100.0),  # decimal, 1-day
-        "resid_std_mean": float(np.nanmean(resid)),
-        "resid_std_var": float(np.nanvar(resid)),
-    }
-
-    # Parameters + (robust) t-stats if available
-    params = res.params
-    diag.update({f"param_{k}": float(v) for k, v in params.items()})
-
-    try:
-        tstats = res.tvalues
-        diag.update({f"t_{k}": float(v) for k, v in tstats.items()})
-    except Exception:
-        pass
-
-    return sigma_hat, diag
-
-
+    return RV_hat
 
 def msar1_fit_predict(y_win: pd.Series, k_regimes: int = 2, switching_variance: bool = True,
                      trend: str = "c", maxiter: int = 200, disp: bool = False):
