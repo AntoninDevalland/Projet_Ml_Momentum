@@ -62,7 +62,7 @@ def rolling_window_forecast(
         # accepte yhat seul ou (yhat, diag)
         yhat = out[0] if isinstance(out, tuple) else out
 
-        forecast_date = y2.index[end + horizon]  # TOUJOURS fin d'horizon
+        forecast_date = y2.index[end + horizon]  #  fin d'horizon
 
         dates.append(forecast_date)
         preds.append(float(yhat))
@@ -132,7 +132,7 @@ def expanding_window_forecast(
 def har_fit_predict(
     y_win: pd.Series,
     X_win: pd.DataFrame,
-) -> tuple[float, dict]:
+    horizon: int = 1) -> tuple[float, dict]:
     """
     HAR: y_{t+1} = a + B' X_t + e_{t+1}
     y_win : Series of target (same freq as X_win)
@@ -172,18 +172,7 @@ def har_fit_predict(
     x_last = X_win.iloc[-1].to_numpy()
     yhat_next = float(beta[0] + beta[1:] @ x_last)
 
-    # diagnostics dict
-    diag = {
-        "alpha": float(beta[0]),
-        "R2_IS": float(r2_is),
-        "n_pairs": int(n),
-    }
-
-    for j, name in enumerate(X_win.columns, start=1):
-        diag[f"beta_{name}"] = float(beta[j])
-        diag[f"t_{name}"] = float(tstats[j])
-
-    return yhat_next, diag
+    return yhat_next
 
 
 def ar1_fit_predict(y_win: pd.Series, horizon: int = 1) -> tuple[float, dict]:
