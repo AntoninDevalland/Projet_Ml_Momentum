@@ -242,9 +242,11 @@ def garch_fit_predict(
     r_win: pd.Series,
     horizon: int,
     p: int = 1,
+    o: int =0,
     q: int = 1,
-    mean: str = "constant",
+    mean: str = "Constant",
     dist: str = "normal",
+    vol:str = "GARCH"
 ) -> float:
     """
     Fit GARCH(p,q) sur des rendements journaliers (en décimal) et prédit la
@@ -288,16 +290,20 @@ def garch_fit_predict(
     am = arch_model(
         r_pct,
         mean=mean_spec,
-        vol="GARCH",
+        vol=vol,
         p=p,
+        o = o,
         q=q,
         dist=dist_spec,
         rescale=False,  # déjà en %
     )
     res = am.fit(disp="off")
 
-    # Variances forecast 1..horizon en (%ret)^2
-    f = res.forecast(horizon=horizon, reindex=False)
+    if vol.upper() == "EGARCH" and horizon > 1:
+        f = res.forecast(horizon=horizon, method="simulation", simulations=2000, reindex=False)
+    else:
+        f = res.forecast(horizon=horizon, reindex=False)
+        
     vars_h = f.variance.iloc[-1].to_numpy()  # longueur = horizon
     var_H_pct2 = float(np.sum(vars_h))       # variance cumulée sur H jours en (%^2)
 
