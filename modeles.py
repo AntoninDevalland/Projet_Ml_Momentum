@@ -348,3 +348,166 @@ def msar1_fit_predict(y_win: pd.Series, k_regimes: int = 2, switching_variance: 
     except Exception as e:
         # In rolling estimation, some windows can fail to converge; don't kill the whole backtest
         return np.nan, {"converged": False, "error": str(e)}
+    
+
+def rebalance_dates_mask(
+    signal: pd.Series,
+    rebalance_freq: str = "M",  # "M", "MS", "W-FRI", "W-MON", "D"
+) -> pd.Series:
+    """
+    Renvoie une série booléenne indexée comme `signal` :
+    True = date de rebalancement, False sinon.
+
+    - "D" : tous les jours
+    - "M" : dernier jour de trading du mois
+    - "MS": premier jour de trading du mois (approx via resample, voir note)
+    - "W-FRI", "W-MON" : rebal hebdo sur le jour indiqué
+    """
+    signal = signal.dropna()
+    idx = signal.index
+
+    if rebalance_freq == "D":
+        return pd.Series(True, index=idx, name="rebalance")
+
+    dummy = pd.Series(1.0, index=idx)
+
+    # Dates candidates générées par resample (puis intersect avec idx)
+    rb_dates = dummy.resample(rebalance_freq).last().dropna().index
+    rb_dates = rb_dates.intersection(idx)
+
+    rb = pd.Series(False, index=idx, name="rebalance")
+    rb.loc[rb_dates] = True
+    return rb
+
+def mom_vol_target_weights(
+    log_var_mom_fcst: pd.Series,      # log(sigma^2) prévu
+    rb: pd.Series,                    # série booléenne True = date de rebalancement
+    target_vol_annual: float = 0.10,  # cible vol annualisée
+    w_max: float = 2.0,               # cap levier
+    no_trade_band: float | None = 0.10,
+    trading_days: int = 252,
+) -> pd.DataFrame:
+    """
+    Stratégie baseline :
+    Portefeuille = w_mom * MOM + (1 - w_mom) * DEF
+
+    Le poids w_mom est déterminé uniquement par la volatilité prévue du facteur MOM.
+    Cette version prend directement en entrée le masque de rebalancement rb (True/False).
+
+    Timing (à gérer hors fonction si besoin):
+    - si log_var_mom_fcst[t] correspond à la prévision pour t+1 mais est datée à t,
+      alors appliquer un shift(1) sur les poids au moment du backtest.
+    """
+
+    # Alignement et nettoyage
+    df = pd.concat({"logvar": log_var_mom_fcst, "rb": rb}, axis=1).dropna()
+    idx = df.index
+    rb_aligned = df["rb"].astype(bool)
+
+    # Vol prévue
+    sigma_hat = np.sqrt(np.exp(df["logvar"].astype(float)))
+
+    # Cible daily
+    sigma_star_daily = target_vol_annual / np.sqrt(trading_days)
+
+    # Poids MOM aux dates de rebalance
+    w_mom_rb = pd.Series(np.nan, index=idx)
+    w_mom_rb.loc[rb_aligned] = sigma_star_daily / sigma_hat.loc[rb_aligned]
+
+    # Bornes
+    w_mom_rb = w_mom_rb.clip(lower=0.0, upper=w_max)
+
+    # No-trade band (appliqué uniquement aux dates rb=True)
+    if no_trade_band is not None:
+        last = np.nan
+        for t in idx:
+            if not rb_aligned.loc[t]:
+                continue
+            cur = w_mom_rb.loc[t]
+            if np.isnan(cur):
+                continue
+            if np.isnan(last):
+                last = cur
+                w_mom_rb.loc[t] = last
+            else:
+                if abs(cur - last) < no_trade_band:
+                    w_mom_rb.loc[t] = last
+                else:
+                    last = cur
+                    w_mom_rb.loc[t] = last
+
+    # Poids constants entre rebalances
+    w_mom = w_mom_rb.ffill().fillna(0.0)
+    w_def = 1.0 - w_mom
+
+    return pd.DataFrame({"w_mom": w_mom, "w_def": w_def}, index=idx)
+
+def performance_metrics(
+    returns: pd.Series,
+    rf: pd.Series | None = None,
+    trading_days: int = 252,
+) -> pd.Series:
+    """
+    Calcule des métriques de performance classiques à partir d'une série de rendements.
+
+    Paramètres
+    ----------
+    returns : pd.Series
+        Rendements du portefeuille (daily).
+    rf : pd.Series | None, optional
+        Rendements sans risque (daily). Si None, rf = 0.
+    trading_days : int
+        Nombre de jours de trading par an (252 par défaut).
+
+    Retour
+    ------
+    pd.Series
+        Série contenant les métriques de performance.
+    """
+
+    returns = returns.dropna()
+
+    if rf is None:
+        rf = pd.Series(0.0, index=returns.index)
+    else:
+        rf = rf.reindex(returns.index).fillna(0.0)
+
+    excess_ret = returns - rf
+
+    # --- Moyennes et volatilités ---
+    mean_daily = returns.mean()
+    vol_daily = returns.std()
+
+    mean_annual = mean_daily * trading_days
+    vol_annual = vol_daily * np.sqrt(trading_days)
+
+    # --- Sharpe ratio ---
+    sharpe = np.nan
+    if vol_annual > 0:
+        sharpe = (excess_ret.mean() * trading_days) / vol_annual
+
+    # --- Drawdown ---
+    cum_ret = (1 + returns).cumprod()
+    running_max = cum_ret.cummax()
+    drawdown = cum_ret / running_max - 1
+    max_drawdown = drawdown.min()
+
+    # --- Autres métriques utiles ---
+    skew = returns.skew()
+    kurt = returns.kurtosis()
+
+    hit_ratio = (returns > 0).mean()
+
+    metrics = pd.Series(
+        {
+            "Mean annual return": mean_annual,
+            "Annual volatility": vol_annual,
+            "Sharpe ratio": sharpe,
+            "Max drawdown": max_drawdown,
+            "Skewness": skew,
+            "Kurtosis": kurt,
+            "Hit ratio": hit_ratio,
+        }
+    )
+
+    return metrics
