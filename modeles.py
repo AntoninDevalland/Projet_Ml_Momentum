@@ -312,18 +312,73 @@ def garch_fit_predict(
 
     return RV_hat
 
-def msar1_fit_predict(y_win: pd.Series, k_regimes: int = 2, switching_variance: bool = True,
-                     trend: str = "c", maxiter: int = 200, disp: bool = False):
+def msar1_fit_predict(
+    y_win: pd.Series,
+    horizon: int = 1,
+    k_regimes: int = 2,
+    switching_variance: bool = True,
+    trend: str = "c",
+    maxiter: int = 200,
+    disp: bool = False,
+):
+        
     """
-    Fit MS-AR(1) on y_win and return 1-step-ahead forecast + diagnostics.
-    """
-    y_arr = y_win.astype(float).to_numpy()
+    Fit un modèle MS-AR(1) sur une fenêtre temporelle et produit une
+    prévision out-of-sample agrégée.
 
-    # AR(1) with Markov-switching intercept (trend='c'), and optionally switching variance
+    Le modèle est un AR(1) à changements de régimes markoviens, avec
+    intercept (optionnel) et variance de l'erreur potentiellement
+    dépendants du régime. La série modélisée est supposée être une
+    log-variance.
+
+    Parameters
+    ----------
+    y_win : pd.Series
+        Fenêtre d'estimation de la série cible (log-variance).
+        Doit être finie (pas de NaN / inf).
+
+    horizon : int
+        Horizon de prévision (>= 1). La fonction renvoie la somme des
+        prévisions sur les périodes t+1 à t+horizon.
+
+    k_regimes : int
+        Nombre de régimes markoviens.
+
+    switching_variance : bool
+        Si True, la variance conditionnelle de l'erreur est spécifique
+        à chaque régime.
+
+    trend : {"c", "n"}
+        Terme déterministe du modèle :
+        "c" inclut un intercept dépendant du régime,
+        "n" n'inclut aucun terme déterministe.
+
+    maxiter : int
+        Nombre maximal d'itérations pour l'optimisation du maximum
+        de vraisemblance.
+
+    disp : bool
+        Si True, affiche les informations de convergence de l'optimiseur.
+
+    Returns
+    -------
+    float
+        Somme des prévisions out-of-sample sur l'horizon demandé,
+        exprimée dans l'échelle de la série d'origine (log-variance).
+        Renvoie np.nan si l'estimation ou la prévision échoue.
+    """
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+
+    # Statsmodels works more reliably with numpy arrays
+    y_arr = y_win.astype(float).to_numpy()
+    n = len(y_arr)
+
+    # MS-AR(1) with regime-dependent intercept and variance
     mod = MarkovRegression(
         endog=y_arr,
         k_regimes=k_regimes,
-        trend=trend,           # 'c' for intercept, 'n' for none
+        trend=trend,
         order=1,
         switching_variance=switching_variance,
     )
@@ -331,24 +386,15 @@ def msar1_fit_predict(y_win: pd.Series, k_regimes: int = 2, switching_variance: 
     try:
         res = mod.fit(disp=disp, maxiter=maxiter)
 
-        # 1-step ahead forecast (end of sample + 1)
-        # predict() uses index in "observation number" units here
-        yhat_next = float(res.predict(start=len(y_arr), end=len(y_arr))[0])
+        # Out-of-sample forecasts: t+1 ... t+horizon
+        fcst = res.predict(start=n, end=n + horizon - 1)
 
-        # Regime probas at the last in-sample point
-        # filtered_marginal_probabilities: (T x k_regimes)
-        p_last = res.filtered_marginal_probabilities[-1]
-        diag = {
-            "converged": bool(getattr(res.mle_retvals, "converged", True)),
-            "llf": float(res.llf),
-            **{f"p_regime_{j}": float(p_last[j]) for j in range(k_regimes)}
-        }
-        return yhat_next, diag
+        # Sum of forecasts (log-variance scale)
+        return float(np.sum(fcst))
 
-    except Exception as e:
-        # In rolling estimation, some windows can fail to converge; don't kill the whole backtest
-        return np.nan, {"converged": False, "error": str(e)}
-    
+    except Exception:
+        # Some rolling windows may fail to converge
+        return np.nan     
 
 def rebalance_dates_mask(
     signal: pd.Series,
