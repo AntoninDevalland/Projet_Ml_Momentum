@@ -516,3 +516,23 @@ def performance_metrics(
     )
 
     return metrics
+
+
+# Adaptateur Universel (ML) pour Rolling Forecast
+def generic_fit_predict(y_win, X_win, horizon=1, model_class=None, **model_params):
+    """
+    Entraîne n'importe quel modèle (model_class) sur la fenêtre et prédit t+horizon.
+    """
+    if len(y_win) <= horizon: return np.nan
+
+    # 1. Alignement temporel (X_t prédit y_{t+h})
+    X_train = X_win.iloc[:-horizon].to_numpy()
+    y_train = y_win.iloc[horizon:].to_numpy()
+
+    # 2. Initialisation et Entraînement
+    model = model_class(**model_params)
+    model.fit(X_train, y_train)
+
+    # 3. Prévision (avec le dernier X connu)
+    X_last = X_win.iloc[-1:].to_numpy()
+    return model.predict(X_last)[0]
