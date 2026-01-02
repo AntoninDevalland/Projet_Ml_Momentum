@@ -9,7 +9,9 @@ from statsmodels.tsa.stattools import adfuller
 from sklearn.metrics import r2_score, mean_squared_error
 from arch import arch_model
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
-
+from sklearn.model_selection import TimeSeriesSplit
+from tqdm import tqdm
+import itertools
 
 def rolling_window_forecast(
     y: pd.Series,
@@ -518,21 +520,131 @@ def performance_metrics(
     return metrics
 
 
-# Adaptateur Universel (ML) pour Rolling Forecast
-def generic_fit_predict(y_win, X_win, horizon=1, model_class=None, **model_params):
+def sklearn_walk_forward(model, X, y, min_train_size, rolling_window=False, gap=0, refit_step=10):
     """
-    Entraîne n'importe quel modèle (model_class) sur la fenêtre et prédit t+horizon.
+    Effectue un Backtest Walk-Forward (fenêtre glissante ou grandissante) avec Scikit-Learn.
+    Permet un ré-entraînement périodique pour accélérer le calcul.
+
+    Parameters
+    ----------
+    model : sklearn estimator (ou Pipeline)
+        Le modèle à entraîner (ex: RandomForest, ElasticNet, LightGBM...).
+    X : pd.DataFrame
+        Les features (variables explicatives).
+    y : pd.Series
+        La target (variable cible). Doit être alignée temporellement avec X.
+    min_train_size : int
+        Taille de l'historique initial nécessaire avant de faire la 1ère prédiction.
+    rolling_window : bool, default=False
+        - False (Expanding) : On garde tout l'historique depuis le début (fenêtre grandissante).
+        - True (Rolling) : On garde une fenêtre fixe de taille `min_train_size` (fenêtre glissante).
+    gap : int, default=0
+        Nombre de jours à exclure entre la fin du train et le test
+    refit_step : int, default=10
+        Fréquence de ré-entraînement du modèle (en jours).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame indexé par la date contenant :
+        - 'Actual': La vraie valeur réalisée.
+        - 'Pred': La valeur prédite par le modèle.
     """
-    if len(y_win) <= horizon: return np.nan
 
-    # 1. Alignement temporel (X_t prédit y_{t+h})
-    X_train = X_win.iloc[:-horizon].to_numpy()
-    y_train = y_win.iloc[horizon:].to_numpy()
+    n_samples = len(X)
+    n_splits = n_samples - min_train_size
+    max_train = min_train_size if rolling_window else None
 
-    # 2. Initialisation et Entraînement
-    model = model_class(**model_params)
-    model.fit(X_train, y_train)
+    # On garde le test_size=1 pour avoir une prédiction quotidienne
+    # Le gap assure la sécurité par rapport à l'horizon de prévision
+    tscv = TimeSeriesSplit(n_splits=n_splits, test_size=1, gap=gap, max_train_size=max_train)
 
-    # 3. Prévision (avec le dernier X connu)
-    X_last = X_win.iloc[-1:].to_numpy()
-    return model.predict(X_last)[0]
+    predictions = []
+    actuals = []
+    dates = []
+
+    # On itère sur tous les jours
+    for i, (train_idx, test_idx) in tqdm(enumerate(tscv.split(X)), total=n_splits):
+
+        # Maj du modèle (Uniquement si on est sur un pas de refit)
+        if i % refit_step == 0:
+            X_train = X.iloc[train_idx]
+            y_train = y.iloc[train_idx]
+            model.fit(X_train, y_train)
+
+        # Prédiction
+        X_test = X.iloc[test_idx]
+        y_test = y.iloc[test_idx]
+        pred = model.predict(X_test)
+        predictions.append(pred[0])
+        actuals.append(y_test.values[0])
+        dates.append(y_test.index[0])
+
+    return pd.DataFrame({"Actual": actuals, "Pred": predictions}, index=dates)
+
+
+def engineer_features(df_raw, price_cols=None):
+    """
+    Génère automatiquement les features techniques et macro.
+    - price_cols : liste des colonnes à traiter comme des prix
+    - Les autres colonnes sont traitées comme des niveaux (Taux, VIX...)
+    """
+    df = df_raw.copy()
+    if price_cols is None: price_cols = []
+
+    # Séparation automatique si non fournie
+    rate_cols = [c for c in df.columns if c not in price_cols]
+
+    X_out = pd.DataFrame(index=df.index)
+
+    # A. Traitement des PRIX (Rendements, Tendance)
+    for col in price_cols:
+        if col in df.columns:
+            X_out[f'{col}_ret1d'] = df[col].pct_change(fill_method=None)
+            X_out[f'{col}_vol21'] = df[col].pct_change(fill_method=None).rolling(21).std()
+            X_out[f'{col}_vol5'] = df[col].pct_change(fill_method=None).rolling(5).std()
+            X_out[f'{col}_vol1'] = df[col].pct_change(fill_method=None).rolling(2).std()
+            X_out[f'{col}_trend'] = (df[col] / df[col].rolling(200).mean()) - 1 # Distance MM200
+
+    # B. Traitement des TAUX (Variations, Cycle)
+    for col in rate_cols:
+        if col in df.columns:
+            X_out[f'{col}_chg1d'] = df[col].diff(1)
+            X_out[f'{col}_gap200'] = df[col] - df[col].rolling(200).mean() # Écart au cycle long
+            X_out[f'{col}_vol21'] = df[col].pct_change(fill_method=None).rolling(21).std()
+            X_out[f'{col}_vol5'] = df[col].pct_change(fill_method=None).rolling(5).std()
+            X_out[f'{col}_vol1'] = df[col].pct_change(fill_method=None).rolling(2).std()
+            X_out[f'{col}_level'] = df[col]
+
+    return X_out.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+
+def add_targeted_lags(df, suffixes, extra_cols=None, lags=[1, 2, 3, 5]):
+    """
+    Ajoute des lags (t-1, t-2...) sur les colonnes qui :
+    1. Finissent par un des 'suffixes' donnés (ex: _ret1d)
+    2. Sont listées dans 'extra_cols' (ex: RV 1j)
+    """
+    df_out = df.copy()
+    if extra_cols is None: extra_cols = []
+
+    # Identifier les colonnes à lagger
+    cols_to_lag = []
+    for col in df.columns:
+        # Condition 1 : Suffixe
+        if any(col.endswith(s) for s in suffixes):
+            cols_to_lag.append(col)
+        # Condition 2 : Colonne explicite (si présente)
+        elif col in extra_cols:
+            cols_to_lag.append(col)
+
+    # Création des lags
+    print(f"Lagging de {len(cols_to_lag)} variables sur {df.shape[1]}")
+
+    for col in cols_to_lag:
+        for lag in lags:
+            new_col_name = f"{col}_lag{lag}"
+            df_out[new_col_name] = df[col].shift(lag)
+
+    return df_out.dropna()
