@@ -618,8 +618,6 @@ def engineer_features(df_raw, price_cols=None):
 
     return X_out.replace([np.inf, -np.inf], np.nan).dropna()
 
-
-
 def add_targeted_lags(df, suffixes, extra_cols=None, lags=[1, 2, 3, 5]):
     """
     Ajoute des lags (t-1, t-2...) sur les colonnes qui :
