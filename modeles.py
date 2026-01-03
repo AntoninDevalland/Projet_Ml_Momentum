@@ -522,65 +522,71 @@ def performance_metrics(
 
 def sklearn_walk_forward(model, X, y, min_train_size, rolling_window=False, gap=0, refit_step=10):
     """
-    Effectue un Backtest Walk-Forward (fenêtre glissante ou grandissante) avec Scikit-Learn.
-    Permet un ré-entraînement périodique pour accélérer le calcul.
+    Walk-forward validation compatible sklearn.
 
-    Parameters
-    ----------
-    model : sklearn estimator (ou Pipeline)
-        Le modèle à entraîner (ex: RandomForest, ElasticNet, LightGBM...).
-    X : pd.DataFrame
-        Les features (variables explicatives).
-    y : pd.Series
-        La target (variable cible). Doit être alignée temporellement avec X.
-    min_train_size : int
-        Taille de l'historique initial nécessaire avant de faire la 1ère prédiction.
-    rolling_window : bool, default=False
-        - False (Expanding) : On garde tout l'historique depuis le début (fenêtre grandissante).
-        - True (Rolling) : On garde une fenêtre fixe de taille `min_train_size` (fenêtre glissante).
-    gap : int, default=0
-        Nombre de jours à exclure entre la fin du train et le test
-    refit_step : int, default=10
-        Fréquence de ré-entraînement du modèle (en jours).
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame indexé par la date contenant :
-        - 'Actual': La vraie valeur réalisée.
-        - 'Pred': La valeur prédite par le modèle.
+    Particularités :
+    - Gestion du 'gap' pour éviter le look-ahead bias.
+    - Paramètre 'refit_step' pour ne pas ré-entraîner tous les jours (gain de temps).
+    - Extrait et aligne l'historique des importances de features.
     """
-
     n_samples = len(X)
     n_splits = n_samples - min_train_size
+
+    # Fenêtre glissante (taille fixe) ou grandissante (historique complet)
     max_train = min_train_size if rolling_window else None
 
-    # On garde le test_size=1 pour avoir une prédiction quotidienne
-    # Le gap assure la sécurité par rapport à l'horizon de prévision
+    # Sécurisation du split temporel
+    # Le 'gap' est crucial ici : il simule le délai de mise en production (ex: gap=1 pour T+1)
     tscv = TimeSeriesSplit(n_splits=n_splits, test_size=1, gap=gap, max_train_size=max_train)
 
     predictions = []
     actuals = []
     dates = []
 
-    # On itère sur tous les jours
+    # Stockage des importances temporelles
+    history_importances = []
+    history_dates = []
+
+    print(f"Lancement du Backtest ({n_splits} itérations, Refit tous les {refit_step} jours)...")
+
     for i, (train_idx, test_idx) in tqdm(enumerate(tscv.split(X)), total=n_splits):
 
-        # Maj du modèle (Uniquement si on est sur un pas de refit)
+        # Isolation des datasets
+        X_test = X.iloc[test_idx]
+        y_test = y.iloc[test_idx]
+        current_date = y_test.index[0]
+
+        # --- Logique de Re-training ---
+        # Optimisation : on ne refit le modèle que tous les 'refit_step' jours
         if i % refit_step == 0:
             X_train = X.iloc[train_idx]
             y_train = y.iloc[train_idx]
+
             model.fit(X_train, y_train)
 
-        # Prédiction
-        X_test = X.iloc[test_idx]
-        y_test = y.iloc[test_idx]
+            # Snapshot de l'importance des variables à cet instant T
+            imps = get_model_coefs(model, X.columns)
+            history_importances.append(imps)
+            history_dates.append(current_date)
+
+        # --- Prédiction ---
+        # On prédit tous les jours, même si le modèle date d'il y a quelques jours (refit_step)
         pred = model.predict(X_test)
+
         predictions.append(pred[0])
         actuals.append(y_test.values[0])
-        dates.append(y_test.index[0])
+        dates.append(current_date)
 
-    return pd.DataFrame({"Actual": actuals, "Pred": predictions}, index=dates)
+    # Consolidation des résultats
+    df_preds = pd.DataFrame({"Actual": actuals, "Pred": predictions}, index=dates)
+
+    # Traitement des importances :
+    # Comme on n'a sauvegardé que les jours de refit, on propage la dernière valeur connue (ffill)
+    # pour avoir une série temporelle continue alignée sur les prédictions.
+    df_importances = pd.DataFrame(history_importances, index=history_dates)
+    df_importances = df_importances.reindex(dates).ffill()
+
+    return df_preds, df_importances
 
 
 def engineer_features(df_raw, price_cols=None):
@@ -644,3 +650,27 @@ def add_targeted_lags(df, suffixes, extra_cols=None, lags=[1, 2, 3, 5]):
             df_out[new_col_name] = df[col].shift(lag)
 
     return df_out.dropna()
+
+
+def get_model_coefs(model, feature_names):
+    """
+    Récupère l'importance des variables (coeffs ou feature_importances)
+    de manière agnostique (Pipeline ou modèle, Linéaire ou Arbre).
+    """
+    # Si on a un Pipeline (ex: Scaler + ElasticNet), il faut aller chercher le modèle à la fin
+    if hasattr(model, 'steps'):
+        estimator = model.steps[-1][1]
+    else:
+        estimator = model
+
+    # Modèles paramétriques (Regressions, ElasticNet, Lasso...)
+    if hasattr(estimator, 'coef_'):
+        return pd.Series(estimator.coef_, index=feature_names)
+
+    # Modèles à base d'arbres (RandomForest, XGBoost...)
+    elif hasattr(estimator, 'feature_importances_'):
+        return pd.Series(estimator.feature_importances_, index=feature_names)
+
+    # Fallback si le modèle n'a rien de tout ça
+    else:
+        return pd.Series(np.nan, index=feature_names)
