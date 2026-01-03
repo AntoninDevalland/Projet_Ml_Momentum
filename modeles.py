@@ -604,19 +604,17 @@ def engineer_features(df_raw, price_cols=None):
             X_out[f'{col}_vol21'] = df[col].pct_change(fill_method=None).rolling(21).std()
             X_out[f'{col}_vol5'] = df[col].pct_change(fill_method=None).rolling(5).std()
             X_out[f'{col}_vol1'] = df[col].pct_change(fill_method=None).rolling(2).std()
-            X_out[f'{col}_trend'] = (df[col] / df[col].rolling(200).mean()) - 1 # Distance MM200
 
     # B. Traitement des TAUX (Variations, Cycle)
     for col in rate_cols:
         if col in df.columns:
             X_out[f'{col}_chg1d'] = df[col].diff(1)
-            X_out[f'{col}_gap200'] = df[col] - df[col].rolling(200).mean() # Écart au cycle long
             X_out[f'{col}_vol21'] = df[col].pct_change(fill_method=None).rolling(21).std()
             X_out[f'{col}_vol5'] = df[col].pct_change(fill_method=None).rolling(5).std()
             X_out[f'{col}_vol1'] = df[col].pct_change(fill_method=None).rolling(2).std()
             X_out[f'{col}_level'] = df[col]
 
-    return X_out.replace([np.inf, -np.inf], np.nan).dropna()
+    return X_out
 
 def add_targeted_lags(df, suffixes, extra_cols=None, lags=[1, 2, 3, 5]):
     """
