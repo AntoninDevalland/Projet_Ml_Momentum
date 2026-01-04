@@ -9,6 +9,7 @@ from statsmodels.tsa.stattools import adfuller
 from sklearn.metrics import r2_score, mean_squared_error
 from arch import arch_model
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+from sklearn.base import clone
 from sklearn.model_selection import TimeSeriesSplit
 from tqdm import tqdm
 import itertools
@@ -520,73 +521,114 @@ def performance_metrics(
     return metrics
 
 
-def sklearn_walk_forward(model, X, y, min_train_size, rolling_window=False, gap=0, refit_step=10):
+def sklearn_walk_forward(
+        base_model,
+        param_grid,
+        X,
+        y,
+        train_window_size,
+        val_window_size,
+        refit_step=10
+):
     """
-    Walk-forward validation compatible sklearn.
+    Walk-Forward avec optimisation Rolling Window et extraction des coef/features importance.
+    Retourne :
+    - df_preds : Prédictions vs Réel
+    - df_params : Historique des meilleurs hyperparamètres
+    - df_importances : Historique des coefficients ou feature importances
+    """
 
-    Particularités :
-    - Gestion du 'gap' pour éviter le look-ahead bias.
-    - Paramètre 'refit_step' pour ne pas ré-entraîner tous les jours (gain de temps).
-    - Extrait et aligne l'historique des importances de features.
-    """
+    # Génération des combinaisons
+    keys, values = zip(*param_grid.items())
+    param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
     n_samples = len(X)
-    n_splits = n_samples - min_train_size
-
-    # Fenêtre glissante (taille fixe) ou grandissante (historique complet)
-    max_train = min_train_size if rolling_window else None
-
-    # Sécurisation du split temporel
-    # Le 'gap' est crucial ici : il simule le délai de mise en production (ex: gap=1 pour T+1)
-    tscv = TimeSeriesSplit(n_splits=n_splits, test_size=1, gap=gap, max_train_size=max_train)
+    total_window = train_window_size + val_window_size
+    start_index = total_window
 
     predictions = []
     actuals = []
     dates = []
 
-    # Stockage des importances temporelles
+    # Stockage des historiques
+    best_params_history = []
     history_importances = []
     history_dates = []
 
-    print(f"Lancement du Backtest ({n_splits} itérations, Refit tous les {refit_step} jours)...")
+    current_best_model = None
 
-    for i, (train_idx, test_idx) in tqdm(enumerate(tscv.split(X)), total=n_splits):
+    # Boucle temporelle
+    for t in tqdm(range(start_index, n_samples)):
 
-        # Isolation des datasets
-        X_test = X.iloc[test_idx]
-        y_test = y.iloc[test_idx]
-        current_date = y_test.index[0]
+        current_date = X.index[t]
 
-        # --- Logique de Re-training ---
-        # Optimisation : on ne refit le modèle que tous les 'refit_step' jours
-        if i % refit_step == 0:
-            X_train = X.iloc[train_idx]
-            y_train = y.iloc[train_idx]
+        # 1 : OPTIMISATION & REFIT
+        if (t - start_index) % refit_step == 0:
 
-            model.fit(X_train, y_train)
+            # Définition des bornes
+            end_val_idx = t
+            start_val_idx = t - val_window_size
+            end_train_idx = start_val_idx
+            start_train_idx = end_train_idx - train_window_size
 
-            # Snapshot de l'importance des variables à cet instant T
-            imps = get_model_coefs(model, X.columns)
+            # Données Train et Val
+            X_train = X.iloc[start_train_idx: end_train_idx]
+            y_train = y.iloc[start_train_idx: end_train_idx]
+            X_val = X.iloc[start_val_idx: end_val_idx]
+            y_val = y.iloc[start_val_idx: end_val_idx]
+
+            # Grid Search manuel
+            best_score = float('inf')
+            best_params = None
+
+            for params in param_combinations:
+                model = clone(base_model)
+                model.set_params(**params)
+                model.fit(X_train, y_train)
+
+                pred_val = model.predict(X_val)
+                rmse = np.sqrt(mean_squared_error(y_val, pred_val))
+
+                if rmse < best_score:
+                    best_score = rmse
+                    best_params = params
+
+            # REFIT FINAL sur (Train + Val)
+            X_total = X.iloc[start_train_idx: end_val_idx]
+            y_total = y.iloc[start_train_idx: end_val_idx]
+
+            current_best_model = clone(base_model)
+            current_best_model.set_params(**best_params)
+            current_best_model.fit(X_total, y_total)
+
+            # Sauvegarde
+            best_params_history.append({**best_params, 'date': current_date})
+
+            # sauvegarde des coefs
+            imps = get_model_coefs(current_best_model, X.columns)
             history_importances.append(imps)
             history_dates.append(current_date)
 
-        # --- Prédiction ---
-        # On prédit tous les jours, même si le modèle date d'il y a quelques jours (refit_step)
-        pred = model.predict(X_test)
+        # 2 Prédiction
+        X_test = X.iloc[t: t + 1]
+        y_test = y.iloc[t: t + 1]
 
-        predictions.append(pred[0])
+        if current_best_model is not None:
+            pred = current_best_model.predict(X_test)[0]
+        else:
+            pred = np.nan
+
+        predictions.append(pred)
         actuals.append(y_test.values[0])
         dates.append(current_date)
 
-    # Consolidation des résultats
     df_preds = pd.DataFrame({"Actual": actuals, "Pred": predictions}, index=dates)
+    df_params = pd.DataFrame(best_params_history).set_index('date').reindex(dates).ffill()
 
-    # Traitement des importances :
-    # Comme on n'a sauvegardé que les jours de refit, on propage la dernière valeur connue (ffill)
-    # pour avoir une série temporelle continue alignée sur les prédictions.
     df_importances = pd.DataFrame(history_importances, index=history_dates)
     df_importances = df_importances.reindex(dates).ffill()
 
-    return df_preds, df_importances
+    return df_preds, df_params, df_importances
 
 
 def engineer_features(df_raw, price_cols=None):
